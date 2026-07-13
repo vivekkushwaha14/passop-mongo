@@ -2,7 +2,7 @@
     "services": {
         "frontend": {
             "root": ".",
-            "framework": "vite"
+            "framework": "express"
         },
         "backend": {
             "root": "backend"
