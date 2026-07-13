@@ -123,9 +123,13 @@ function normalizeId(id) {
   return id;
 }
 
-function normalizeCreatePayload(payload) {
+function normalizeCreatePayload(payload, userId) {
+  if (!userId) {
+    throw createHttpError(401, 'Unauthorized: X-User-Id header is required');
+  }
   return {
     id: payload.id ? normalizeId(payload.id) : crypto.randomUUID(),
+    userId: userId,
     site: normalizeSite(payload.site),
     username: normalizeString(payload.username, 'Username', 1),
     password: encryptPassword(normalizeString(payload.password, 'Password', 4)),
@@ -173,9 +177,74 @@ function serializeRecord(record) {
   };
 }
 
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (!storedHash || !storedHash.includes(':')) {
+    return false;
+  }
+  const [salt, hash] = storedHash.split(':');
+  const checkHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return hash === checkHash;
+}
+
+function getUsersCollection() {
+  return client.db(dbName).collection('users');
+}
+
+async function signupUser(req, res, next) {
+  try {
+    const username = normalizeString(req.body.username, 'Username', 3).toLowerCase();
+    const password = normalizeString(req.body.password, 'Password', 4);
+
+    const users = getUsersCollection();
+    const existingUser = await users.findOne({ username });
+    if (existingUser) {
+      throw createHttpError(409, 'Username already exists');
+    }
+
+    const passwordHash = hashPassword(password);
+    const newUser = {
+      username,
+      passwordHash,
+      createdAt: new Date(),
+    };
+
+    await users.insertOne(newUser);
+    res.status(201).json({ success: true, user: { username } });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function loginUser(req, res, next) {
+  try {
+    const username = normalizeString(req.body.username, 'Username', 3).toLowerCase();
+    const password = normalizeString(req.body.password, 'Password', 4);
+
+    const users = getUsersCollection();
+    const user = await users.findOne({ username });
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+      throw createHttpError(401, 'Invalid username or password');
+    }
+
+    res.json({ success: true, user: { username } });
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function listPasswords(req, res, next) {
   try {
-    const records = await getCollection().find({}).sort({ updatedAt: -1 }).toArray();
+    const userId = req.headers['x-user-id'];
+    if (!userId) {
+      throw createHttpError(401, 'Unauthorized: X-User-Id header is required');
+    }
+    const records = await getCollection().find({ userId }).sort({ updatedAt: -1 }).toArray();
     res.json(records.map(serializeRecord));
   } catch (error) {
     next(error);
@@ -184,7 +253,8 @@ async function listPasswords(req, res, next) {
 
 async function createPassword(req, res, next) {
   try {
-    const password = normalizeCreatePayload(req.body);
+    const userId = req.headers['x-user-id'];
+    const password = normalizeCreatePayload(req.body, userId);
     await getCollection().insertOne(password);
     res.status(201).json({ success: true, password: serializeRecord(password) });
   } catch (error) {
@@ -199,17 +269,21 @@ async function createPassword(req, res, next) {
 
 async function updatePassword(req, res, next) {
   try {
+    const userId = req.headers['x-user-id'];
+    if (!userId) {
+      throw createHttpError(401, 'Unauthorized: X-User-Id header is required');
+    }
     const id = normalizeId(req.params.id);
     const update = normalizeUpdatePayload(req.body);
     const result = await getCollection().findOneAndUpdate(
-      { id },
+      { id, userId },
       { $set: update },
       { returnDocument: 'after' },
     );
 
     const updatedRecord = result.value || result;
     if (!updatedRecord) {
-      throw createHttpError(404, 'Password not found');
+      throw createHttpError(404, 'Password not found or unauthorized');
     }
 
     res.json({ success: true, password: serializeRecord(updatedRecord) });
@@ -220,11 +294,15 @@ async function updatePassword(req, res, next) {
 
 async function deletePassword(req, res, next) {
   try {
+    const userId = req.headers['x-user-id'];
+    if (!userId) {
+      throw createHttpError(401, 'Unauthorized: X-User-Id header is required');
+    }
     const id = normalizeId(req.params.id);
-    const result = await getCollection().deleteOne({ id });
+    const result = await getCollection().deleteOne({ id, userId });
 
     if (result.deletedCount === 0) {
-      throw createHttpError(404, 'Password not found');
+      throw createHttpError(404, 'Password not found or unauthorized');
     }
 
     res.json({ success: true });
@@ -237,12 +315,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Authentication routes
+app.post('/api/signup', signupUser);
+app.post('/api/login', loginUser);
+
+// Passwords routes
 app.get('/api/passwords', listPasswords);
 app.post('/api/passwords', createPassword);
 app.patch('/api/passwords/:id', updatePassword);
 app.delete('/api/passwords/:id', deletePassword);
 
-// Temporary compatibility routes for the current frontend. Move the UI to /api/passwords next.
+// Temporary compatibility routes for the current frontend.
 app.get('/', listPasswords);
 app.post('/', createPassword);
 app.delete('/', (req, res, next) => {
@@ -268,6 +351,8 @@ app.use((error, req, res, _next) => {
 async function startServer() {
   await client.connect();
   await getCollection().createIndex({ id: 1 }, { unique: true });
+  await getCollection().createIndex({ userId: 1 });
+  await client.db(dbName).collection('users').createIndex({ username: 1 }, { unique: true });
 
   const server = app.listen(port, () => {
     console.log(`PassOp API listening on port ${port}`);
